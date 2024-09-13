@@ -122,6 +122,24 @@ def getauth(host):
             return ''
         return 'A10 ' + auth['authresponse']['signature']
 
+def logoff(host, token):
+    logoff_url = f"https://{host}/axapi/v3/logoff"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": token
+    }
+    try:
+        response = requests.post(logoff_url, headers=headers, verify=False, timeout=API_TIMEOUT)
+        if response.status_code == 200:
+            logger.info(f"Successfully logged off from {host}.")
+        else:
+            logger.error(f"Failed to log off from {host}. Status code: {response.status_code}")
+            logger.error(response.text)
+    except requests.exceptions.Timeout:
+        logger.error(f"Logoff request to {host} timed out.")
+    except Exception as e:
+        logger.exception(f"Exception occurred during logoff: {e}")
+
 
 def get(api_endpoints, endpoint, host_ip, headers):
     try:
@@ -293,6 +311,8 @@ def generic_exporter():
             logger.exception(ex.args[0])
             return api_endpoint + " has something missing."
     logger.debug("Final Response - " + str(res))
+    logoff(host_ip, token)
+    logger.info("Session ended, logoff executed.")
     return Response(res, mimetype="text/plain")
 
 
