@@ -30,23 +30,47 @@ lock1 = Lock()
 tokens = dict()
 
 
-def get_valid_token(host_ip, to_call=False):
+def get_valid_token(host_ip, force_renew=False):
+    """Retrieve a valid authentication token for the given host_ip."""
     global tokens
     lock1.acquire()
     try:
-        if host_ip in tokens and not to_call:
-            return tokens[host_ip]
-        else:
-            token = ""
-            if host_ip not in tokens or to_call:
-                token = getauth(host_ip)
+        # If force_renew is True or token does not exist, get a new one
+        if host_ip not in tokens or force_renew:
+            token = getauth(host_ip)
             if not token:
-                logger.error("Auth token not received.")
+                logger.error("Auth token not received for host: %s", host_ip)
                 return ""
             tokens[host_ip] = token
         return tokens[host_ip]
     finally:
         lock1.release()
+
+
+def logoff(host, token):
+    """Log off from the specified host using the provided token."""
+    logoff_url = f"https://{host}/axapi/v3/logoff"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": token
+    }
+    try:
+        response = requests.post(logoff_url, headers=headers, verify=False, timeout=API_TIMEOUT)
+        if response.status_code == 200:
+            logger.info("Successfully logged off from %s.", host)
+            # Remove the token from the tokens dictionary after successful logoff
+            with lock1:
+                if host in tokens:
+                    del tokens[host]
+        elif response.status_code == 401:
+            logger.warning("Session already invalid for %s. Token may have expired.", host)
+        else:
+            logger.error("Failed to log off from %s. Status code: %d", host, response.status_code)
+            logger.error(response.text)
+    except requests.exceptions.Timeout:
+        logger.error("Logoff request to %s timed out.", host)
+    except Exception as e:
+        logger.exception("Exception occurred during logoff: %s", e)
 
 
 def set_logger(log_file, log_level):
@@ -121,25 +145,6 @@ def getauth(host):
             logger.error("Host credentials are not correct")
             return ''
         return 'A10 ' + auth['authresponse']['signature']
-
-def logoff(host, token):
-    logoff_url = f"https://{host}/axapi/v3/logoff"
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": token
-    }
-    try:
-        response = requests.post(logoff_url, headers=headers, verify=False, timeout=API_TIMEOUT)
-        if response.status_code == 200:
-            logger.info(f"Successfully logged off from {host}.")
-        else:
-            logger.error(f"Failed to log off from {host}. Status code: {response.status_code}")
-            logger.error(response.text)
-    except requests.exceptions.Timeout:
-        logger.error(f"Logoff request to {host} timed out.")
-    except Exception as e:
-        logger.exception(f"Exception occurred during logoff: {e}")
-
 
 def get(api_endpoints, endpoint, host_ip, headers):
     try:
