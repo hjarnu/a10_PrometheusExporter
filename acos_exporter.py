@@ -1,6 +1,7 @@
 import json
 import yaml
 import sys
+import os
 from threading import Lock
 
 import prometheus_client
@@ -18,6 +19,39 @@ PLUS = "+"
 
 LOG_FILE_SIZE = 5*1024*1024
 API_TIMEOUT = 5
+# batch-get can legitimately take longer than a single auth call; keep it under
+# the Prometheus scrape_timeout (15s) so a slow/hung device can't wedge the worker.
+BATCH_TIMEOUT = 12
+
+# An expired/invalid A10 token comes back as HTTP 401/403 - that status is the
+# reliable signal we key on. The keyword list is only a fallback for devices that
+# answer 200 with an error body. We have seen more than one body shape, so match
+# against all of them:
+#   A10 AxAPI:  {"response": {"err": {"msg": "... Unauthorized ..."}}}
+#   DRF-style:  {"detail": "Authentication credentials were not provided.",
+#                "code": "not_authenticated"}
+AUTH_ERROR_KEYWORDS = (
+    "unauthorized", "not authorized", "not_authenticated", "not authenticated",
+    "authentication credentials", "invalid session", "session expired",
+    "session id", "expired", "forbidden",
+)
+
+
+def is_auth_error(status_code, response):
+    if status_code in (401, 403):
+        return True
+    if not isinstance(response, dict):
+        return False
+    err = response.get("response")
+    err_msg = ""
+    if isinstance(err, dict) and isinstance(err.get("err"), dict):
+        err_msg = str(err["err"].get("msg", ""))
+    blob = " ".join((
+        str(response.get("detail", "")),
+        str(response.get("code", "")),
+        err_msg,
+    )).lower()
+    return any(keyword in blob for keyword in AUTH_ERROR_KEYWORDS)
 
 global_api_collection = dict()
 global_stats = dict()
@@ -30,16 +64,19 @@ lock1 = Lock()
 tokens = dict()
 
 
-def get_valid_token(host_ip, force_renew=False):
-    """Retrieve a valid authentication token for the given host_ip."""
+def get_valid_token(host_ip, to_call=False):
     global tokens
     lock1.acquire()
     try:
-        # If force_renew is True or token does not exist, get a new one
-        if host_ip not in tokens or force_renew:
-            token = getauth(host_ip)
+        if host_ip in tokens and not to_call:
+            return tokens[host_ip]
+        else:
+            token = ""
+            if host_ip not in tokens or to_call:
+                token = getauth(host_ip)
             if not token:
-                logger.error("Auth token not received for host: %s", host_ip)
+                logger.error("Auth token not received for host %s.", host_ip)
+                tokens.pop(host_ip, None)
                 return ""
             tokens[host_ip] = token
         return tokens[host_ip]
@@ -47,30 +84,10 @@ def get_valid_token(host_ip, force_renew=False):
         lock1.release()
 
 
-def logoff(host, token):
-    """Log off from the specified host using the provided token."""
-    logoff_url = f"https://{host}/axapi/v3/logoff"
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": token
-    }
-    try:
-        response = requests.post(logoff_url, headers=headers, verify=False, timeout=API_TIMEOUT)
-        if response.status_code == 200:
-            logger.info("Successfully logged off from %s.", host)
-            # Remove the token from the tokens dictionary after successful logoff
-            with lock1:
-                if host in tokens:
-                    del tokens[host]
-        elif response.status_code == 401:
-            logger.warning("Session already invalid for %s. Token may have expired.", host)
-        else:
-            logger.error("Failed to log off from %s. Status code: %d", host, response.status_code)
-            logger.error(response.text)
-    except requests.exceptions.Timeout:
-        logger.error("Logoff request to %s timed out.", host)
-    except Exception as e:
-        logger.exception("Exception occurred during logoff: %s", e)
+def invalidate_token(host_ip):
+    """Drop a cached token so the next scrape is forced to re-authenticate."""
+    with lock1:
+        tokens.pop(host_ip, None)
 
 
 def set_logger(log_file, log_level):
@@ -99,6 +116,11 @@ def set_logger(log_file, log_level):
     logger = logging.getLogger('a10_prometheus_exporter_logger')
     logger.setLevel(log_levels[log_level.upper()])
     logger.addHandler(log_handler)
+    # Also emit to stdout so logs show up in `kubectl logs` and get shipped to Loki.
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setFormatter(log_formatter)
+    stream_handler.setLevel(log_levels[log_level.upper()])
+    logger.addHandler(stream_handler)
     return logger
 
 
@@ -119,32 +141,32 @@ def getLabelNameFromA10URL(api_list):
 
 
 def getauth(host):
-    with open('config.yml') as f:
+    '''with open('config.yml') as f:
         hosts_data = yaml.safe_load(f)["hosts"]
     if host not in hosts_data:
         logger.error("Host credentials not found in creds config")
         return ''
-    else:
-        uname = hosts_data[host].get('username','')
-        pwd = hosts_data[host].get('password','')
-        if not uname:
-            logger.error("username not provided.")
-        if not pwd:
-            logger.error("password not provided.")
+    else:'''
+    uname = os.environ.get('username','')
+    pwd = os.environ.get('password','')
+    if not uname:
+        logger.error("username not provided.")
+    if not pwd:
+        logger.error("password not provided.")
 
-        payload = {'Credentials': {'username': uname, 'password': pwd}}
-        try:
-            auth = json.loads(requests.post("https://{host}/axapi/v3/auth".format(host=host), json=payload,
-                                            verify=False, timeout=API_TIMEOUT).content.decode('UTF-8'))
-        except requests.exceptions.Timeout:
-            logger.error("Connection to {host} timed out. (connect timeout={timeout} secs)".format(host=host,
-                                                                                                   timeout=API_TIMEOUT))
-            return ''
+    payload = {'Credentials': {'username': uname, 'password': pwd}}
+    try:
+        auth = json.loads(requests.post("https://{host}/axapi/v3/auth".format(host=host), json=payload,
+                                        verify=False, timeout=API_TIMEOUT).content.decode('UTF-8'))
+    except requests.exceptions.RequestException as e:
+        logger.error("Auth request to %s failed: %s", host, e)
+        return ''
 
-        if 'authresponse' not in auth:
-            logger.error("Host credentials are not correct")
-            return ''
-        return 'A10 ' + auth['authresponse']['signature']
+    if 'authresponse' not in auth:
+        logger.error("Host credentials are not correct")
+        return ''
+    return 'A10 ' + auth['authresponse']['signature']
+
 
 def get(api_endpoints, endpoint, host_ip, headers):
     try:
@@ -155,28 +177,35 @@ def get(api_endpoints, endpoint, host_ip, headers):
             body["batch-get-list"].append({"uri": "/axapi/v3" + api_endpoint })
           
         batch_endpoint = "/batch-get"
-        logger.info("Uri - " + endpoint + batch_endpoint)
-        response = json.loads(
-            requests.post(endpoint+batch_endpoint, data=json.dumps(body), headers=headers, verify=False).content.decode('UTF-8'))
-        logger.debug("AXAPI batch response - " + str(response))
+        url = endpoint + batch_endpoint
+        logger.info("Uri - %s", url)
+        raw = requests.post(url, data=json.dumps(body), headers=headers,
+                            verify=False, timeout=BATCH_TIMEOUT)
+        response = json.loads(raw.content.decode('UTF-8'))
+        logger.debug("AXAPI batch response - %s", response)
 
-        if 'response' in response and 'err' in response['response']:
-            msg = response['response']['err']['msg']
-            if str(msg).lower().__contains__("uri not found"):
-                logger.error("Request for api failed - batch-get"  + ", response - " + msg)
-
-            elif str(msg).lower().__contains__("unauthorized"):
-                token = get_valid_token(host_ip, True)
-                if token:
-                    logger.info("Re-executing an api -", endpoint+batch_endpoint, " with the new token")
-                    headers = {'content-type': 'application/json', 'Authorization': token}
-                    response = json.loads(
-                        requests.post(endpoint+batch_endpoint, data=json.dumps(body), headers=headers, verify=False).content.decode('UTF-8'))
+        if is_auth_error(raw.status_code, response):
+            # Cached token is stale/expired (e.g. HTTP 401 not_authenticated).
+            # Force a fresh login and retry the batch once.
+            logger.warning("Auth rejected (status=%s) for host %s; refreshing token and retrying.",
+                           raw.status_code, host_ip)
+            token = get_valid_token(host_ip, to_call=True)
+            if token:
+                headers = {'content-type': 'application/json', 'Authorization': token}
+                raw = requests.post(url, data=json.dumps(body), headers=headers,
+                                    verify=False, timeout=BATCH_TIMEOUT)
+                response = json.loads(raw.content.decode('UTF-8'))
             else:
-                logger.error("Unknown error message - ", msg)
+                logger.error("Token refresh failed for host %s; will retry on next scrape.", host_ip)
+        elif isinstance(response, dict) and isinstance(response.get('response'), dict) \
+                and 'err' in response['response']:
+            logger.error("AXAPI error for host %s - %s",
+                         host_ip, response['response']['err'].get('msg'))
     except Exception as e:
-        logger.error("Exception caught - ", e)
-        response = ""
+        logger.exception("Exception during batch-get for host %s: %s", host_ip, e)
+        # Drop the token so a connection/parse failure can't pin us to a bad session.
+        invalidate_token(host_ip)
+        response = {}
     return response
 
 
@@ -263,7 +292,7 @@ def parse_recursion(event, api_name, api_response, partition, host_ip, key,res, 
 def generic_exporter():
     logger.debug("---------------------------------------------------------------------------------------------------")
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-    host_ip = request.args.get("host_ip","")
+    host_ip = request.args.get("host_ip", "") or os.environ.get("A10_HOST", "")
     api_endpoints = request.args.getlist("api_endpoint")
     if not api_endpoints:
         with open("apis.txt") as file:
@@ -316,8 +345,6 @@ def generic_exporter():
             logger.exception(ex.args[0])
             return api_endpoint + " has something missing."
     logger.debug("Final Response - " + str(res))
-    logoff(host_ip, token)
-    logger.info("Session ended, logoff executed.")
     return Response(res, mimetype="text/plain")
 
 
@@ -327,12 +354,11 @@ def main():
 
 if __name__ == '__main__':
     try:
-        with open('config.yml') as f:
-            log_data = yaml.safe_load(f).get("log", {})
-            logger = set_logger(log_data.get("log_file","exporter.log"), log_data.get("log_level","INFO"))
-            logger.info("Starting exporter")
-            main()
+        #with open('config.yml') as f:
+            #log_data = yaml.safe_load(f).get("log", {})
+        logger = set_logger("logs.log", "INFO")
+        logger.info("Starting exporter")
+        main()
     except Exception as e:
         print(e)
         sys.exit()
-
